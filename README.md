@@ -1,4 +1,6 @@
 redhat-2.6.32-xen-dom0-kernel
 =============================
 
-Personal hacks/backports of Redhat's el6-2.6.32 Xen dom0 support
+Personal hacks/backports of Redhat's el6-2.6.32 Xen dom0 support.
+
+!!! This kernel is not officially supported by Redhat !!!
