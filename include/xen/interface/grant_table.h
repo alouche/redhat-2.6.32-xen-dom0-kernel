@@ -321,6 +321,17 @@ struct gnttab_query_size {
 };
 DEFINE_GUEST_HANDLE_STRUCT(gnttab_query_size);
 
+#define GNTTABOP_unmap_and_replace    7
+struct gnttab_unmap_and_replace {
+    /* IN parameters. */
+    uint64_t host_addr;
+    uint64_t new_addr;
+    grant_handle_t handle;
+    /* OUT parameters. */
+    int16_t  status;              /* GNTST_* */
+};
+DEFINE_GUEST_HANDLE_STRUCT(gnttab_unmap_and_replace);
+
 /*
  * Bitfield values for update_pin_status.flags.
  */
