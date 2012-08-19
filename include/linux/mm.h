@@ -113,6 +113,12 @@ extern unsigned int kobjsize(const void *objp);
 #define VM_HUGEPAGE	0x100000000UL	/* MADV_HUGEPAGE marked this vma */
 #endif
 
+#ifdef CONFIG_XEN
+#define VM_FOREIGN  0x20000000      /* Has pages belonging to another VM */
+struct vm_foreign_map {
+        struct page **map;
+};
+
 /* Bits set in the VMA until the stack is in its final location */
 #define VM_STACK_INCOMPLETE_SETUP	(VM_RAND_READ | VM_SEQ_READ)
 
