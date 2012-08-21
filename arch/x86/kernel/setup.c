@@ -91,6 +91,7 @@
 #include <asm/cacheflush.h>
 #include <asm/processor.h>
 #include <asm/bugs.h>
+#include <asm/tlbflush.h>
 
 #include <asm/system.h>
 #include <asm/vsyscall.h>
@@ -1007,6 +1008,8 @@ void __init setup_arch(char **cmdline_p)
 #endif
 
 	initmem_init(0, max_pfn);
+
+	init_smp_flush();
 
 #ifdef CONFIG_ACPI_SLEEP
 	/*
