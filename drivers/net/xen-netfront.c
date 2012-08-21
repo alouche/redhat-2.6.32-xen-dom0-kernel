@@ -42,6 +42,7 @@
 #include <linux/mm.h>
 #include <net/ip.h>
 
+#include <xen/xen.h>
 #include <xen/xenbus.h>
 #include <xen/events.h>
 #include <xen/page.h>
@@ -51,16 +52,28 @@
 #include <xen/interface/memory.h>
 #include <xen/interface/grant_table.h>
 
-#include <linux/pci.h>
-#include <net/net_namespace.h>
-#include <linux/if_arp.h>
-
 static const struct ethtool_ops xennet_ethtool_ops;
-static int print_once;
+
+static int use_smartpoll = 0;
+module_param(use_smartpoll, int, 0600);
+MODULE_PARM_DESC (use_smartpoll, "Use smartpoll mechanism if available");
 
 struct netfront_cb {
 	struct page *page;
 	unsigned offset;
+};
+
+#define MICRO_SECOND 1000000UL
+#define NANO_SECOND 1000000000UL
+#define DEFAULT_SMART_POLL_FREQ   1000UL
+
+struct netfront_smart_poll {
+	struct hrtimer timer;
+	struct net_device *netdev;
+	unsigned int smart_poll_freq;
+	unsigned int feature_smart_poll;
+	unsigned int active;
+	unsigned long counter;
 };
 
 #define NETFRONT_SKB_CB(skb)	((struct netfront_cb *)((skb)->cb))
@@ -69,8 +82,8 @@ struct netfront_cb {
 
 #define GRANT_INVALID_REF	0
 
-#define NET_TX_RING_SIZE __RING_SIZE((struct xen_netif_tx_sring *)0, PAGE_SIZE)
-#define NET_RX_RING_SIZE __RING_SIZE((struct xen_netif_rx_sring *)0, PAGE_SIZE)
+#define NET_TX_RING_SIZE __CONST_RING_SIZE(xen_netif_tx, PAGE_SIZE)
+#define NET_RX_RING_SIZE __CONST_RING_SIZE(xen_netif_rx, PAGE_SIZE)
 #define TX_MAX_TARGET min_t(int, NET_RX_RING_SIZE, 256)
 
 struct netfront_info {
@@ -109,7 +122,7 @@ struct netfront_info {
 
 	/* Receive-ring batched refills. */
 #define RX_MIN_TARGET 8
-#define RX_DFL_MIN_TARGET 64
+#define RX_DFL_MIN_TARGET 80
 #define RX_MAX_TARGET min_t(int, NET_RX_RING_SIZE, 256)
 	unsigned rx_min_target, rx_max_target, rx_target;
 	struct sk_buff_head rx_batch;
@@ -123,6 +136,8 @@ struct netfront_info {
 	unsigned long rx_pfn_array[NET_RX_RING_SIZE];
 	struct multicall_entry rx_mcl[NET_RX_RING_SIZE+1];
 	struct mmu_update rx_mmu[NET_RX_RING_SIZE];
+
+	struct netfront_smart_poll smart_poll;
 };
 
 struct netfront_rx_info {
@@ -342,15 +357,17 @@ static int xennet_open(struct net_device *dev)
 	return 0;
 }
 
-static void xennet_tx_buf_gc(struct net_device *dev)
+static int xennet_tx_buf_gc(struct net_device *dev)
 {
 	RING_IDX cons, prod;
+	RING_IDX cons_begin, cons_end;
 	unsigned short id;
 	struct netfront_info *np = netdev_priv(dev);
 	struct sk_buff *skb;
 
 	BUG_ON(!netif_carrier_ok(dev));
 
+	cons_begin = np->tx.rsp_cons;
 	do {
 		prod = np->tx.sring->rsp_prod;
 		rmb(); /* Ensure we see responses up to 'rp'. */
@@ -395,7 +412,11 @@ static void xennet_tx_buf_gc(struct net_device *dev)
 		mb();		/* update shared area */
 	} while ((cons == prod) && (prod != np->tx.sring->rsp_prod));
 
+	cons_end = np->tx.rsp_cons;
+
 	xennet_maybe_wake_tx(dev);
+
+	return (cons_begin == cons_end);
 }
 
 static void xennet_make_frags(struct sk_buff *skb, struct net_device *dev,
@@ -1179,9 +1200,7 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 	netdev->netdev_ops	= &xennet_netdev_ops;
 
 	netif_napi_add(netdev, &np->napi, xennet_poll, 64);
-
-	/* Assume all features and let xennet_set_features fix up.  */
-	netdev->features        = NETIF_F_IP_CSUM | NETIF_F_SG | NETIF_F_TSO;
+	netdev->features        = NETIF_F_IP_CSUM;
 
 	SET_ETHTOOL_OPS(netdev, &xennet_ethtool_ops);
 	SET_NETDEV_DEV(netdev, &dev->dev);
@@ -1199,28 +1218,6 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 	return ERR_PTR(err);
 }
 
-static int xen_net_read_mac(struct xenbus_device *dev, u8 mac[])
-{
-	char *s, *e, *macstr;
-	int i;
-
-	macstr = s = xenbus_read(XBT_NIL, dev->nodename, "mac", NULL);
-	if (IS_ERR(macstr))
-		return PTR_ERR(macstr);
-
-	for (i = 0; i < ETH_ALEN; i++) {
-		mac[i] = simple_strtoul(s, &e, 16);
-		if ((s == e) || (*e != ((i == ETH_ALEN-1) ? '\0' : ':'))) {
-			kfree(macstr);
-			return -ENOENT;
-		}
-		s = e+1;
-	}
-
-	kfree(macstr);
-	return 0;
-}
-
 /**
  * Entry point to this code when a new device is created.  Allocate the basic
  * structures and the ring buffers for communication with the backend, and
@@ -1231,50 +1228,7 @@ static int __devinit netfront_probe(struct xenbus_device *dev,
 {
 	int err;
 	struct net_device *netdev;
-	struct net_device *netdev_found=NULL;
 	struct netfront_info *info;
-	char mac_addr[ETH_ALEN];
-
-	/*
-	 * Before anything normal is done, check for the abnormal setup of xen tools
-	 * starting up a guest with an 8139 _and_ a xen-vnif with the same mac addr;
-	 * this makes network tools, like udev &/or NetworkManager have a nutty.
-	 * So, if this situation exists, don't register the xen-vnif, and print out
-	 * a message to change the xen guest configuration to add type=netfront
-	 * to the vif spec if xen-vnif is desired network configuration.
-	 */
-	err = xen_net_read_mac(dev, mac_addr);
-	if (err) {
-		xenbus_dev_fatal(dev, err, "parsing %s/mac", dev->nodename);
-		goto out;
-	}
-	rtnl_lock(); /* dev_getbyhwaddr() throws assert w/o this lock */
-	netdev_found = dev_getbyhwaddr(&init_net, ARPHRD_ETHER, mac_addr);
-	rtnl_unlock();
-	if (netdev_found) {
-		struct pci_dev *pdev_8139_in_netdev;
-		struct pci_dev *pdev_8139=NULL;
-		/* Now check if 8139 connected to PCI;
-		 * if so, check that it's the same one associated with net_dev
-		 * if so, 3 strikes, you're out... don't configure xen-vnif
-		 */
-		 pdev_8139 = pci_get_subsys(PCI_VENDOR_ID_REALTEK,
-		 			    PCI_DEVICE_ID_REALTEK_8139,
-					    PCI_VENDOR_ID_XEN,
-					    PCI_DEVICE_ID_XEN_PLATFORM,
-					    NULL);
-		if (pdev_8139) {
-			pdev_8139_in_netdev = to_pci_dev(netdev_found->dev.parent);
-			if ((pdev_8139_in_netdev == pdev_8139) && !print_once) {
-				printk("Xen: found realtek-8139 w/same mac-addr as xen-vnif; ");
-				printk(" skipping xen-vnif configuration \n");
-				printk(" Add 'type=netfront' to xen guest's vif config line so");
-				printk(" xen-vnif is only, primary network device\n");
-				print_once++;
-				return -ENODEV;
-			}
-		}
-	}
 
 	netdev = xennet_create_dev(dev);
 	if (IS_ERR(netdev)) {
@@ -1306,7 +1260,6 @@ static int __devinit netfront_probe(struct xenbus_device *dev,
  fail:
 	free_netdev(netdev);
 	dev_set_drvdata(&dev->dev, NULL);
-out:
 	return err;
 }
 
@@ -1340,6 +1293,14 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 	info->rx.sring = NULL;
 }
 
+static int netfront_suspend(struct xenbus_device *dev, pm_message_t state)
+{
+	struct netfront_info *info = dev_get_drvdata(&dev->dev);
+	struct hrtimer *timer = &info->smart_poll.timer;
+	hrtimer_cancel(timer);
+	return 0;
+}
+
 /**
  * We are reconnecting to the backend, due to a suspend/resume, or a backend
  * driver restart.  We tear down our netif structure and recreate it, but
@@ -1356,6 +1317,81 @@ static int netfront_resume(struct xenbus_device *dev)
 	return 0;
 }
 
+static int xen_net_read_mac(struct xenbus_device *dev, u8 mac[])
+{
+	char *s, *e, *macstr;
+	int i;
+
+	macstr = s = xenbus_read(XBT_NIL, dev->nodename, "mac", NULL);
+	if (IS_ERR(macstr))
+		return PTR_ERR(macstr);
+
+	for (i = 0; i < ETH_ALEN; i++) {
+		mac[i] = simple_strtoul(s, &e, 16);
+		if ((s == e) || (*e != ((i == ETH_ALEN-1) ? '\0' : ':'))) {
+			kfree(macstr);
+			return -ENOENT;
+		}
+		s = e+1;
+	}
+
+	kfree(macstr);
+	return 0;
+}
+
+static enum hrtimer_restart smart_poll_function(struct hrtimer *timer)
+{
+	struct netfront_smart_poll *psmart_poll;
+	struct net_device *dev;
+	struct netfront_info *np;
+	unsigned long flags;
+	unsigned int tx_active = 0, rx_active = 0;
+
+	psmart_poll = container_of(timer, struct netfront_smart_poll, timer);
+	dev = psmart_poll->netdev;
+	np = netdev_priv(dev);
+
+	spin_lock_irqsave(&np->tx_lock, flags);
+
+	if (!np->rx.sring)
+		goto end;
+
+	np->smart_poll.counter++;
+
+	if (likely(netif_carrier_ok(dev))) {
+		tx_active = !(xennet_tx_buf_gc(dev));
+		/* Under tx_lock: protects access to rx shared-ring indexes. */
+		if (RING_HAS_UNCONSUMED_RESPONSES(&np->rx)) {
+			rx_active = 1;
+			napi_schedule(&np->napi);
+		}
+	}
+
+	np->smart_poll.active |= (tx_active || rx_active);
+	if (np->smart_poll.counter %
+			(np->smart_poll.smart_poll_freq / 10) == 0) {
+		if (!np->smart_poll.active) {
+			np->rx.sring->private.netif.smartpoll_active = 0;
+			goto end;
+		}
+		np->smart_poll.active = 0;
+	}
+
+	if (np->rx.sring->private.netif.smartpoll_active) {
+		if ( hrtimer_start(timer,
+			ktime_set(0, NANO_SECOND/psmart_poll->smart_poll_freq),
+			HRTIMER_MODE_REL) ) {
+			printk(KERN_DEBUG "Failed to start hrtimer,"
+					"use interrupt mode for this packet\n");
+			np->rx.sring->private.netif.smartpoll_active = 0;
+		}
+	}
+
+end:
+	spin_unlock_irqrestore(&np->tx_lock, flags);
+	return HRTIMER_NORESTART;
+}
+
 static irqreturn_t xennet_interrupt(int irq, void *dev_id)
 {
 	struct net_device *dev = dev_id;
@@ -1369,6 +1405,16 @@ static irqreturn_t xennet_interrupt(int irq, void *dev_id)
 		/* Under tx_lock: protects access to rx shared-ring indexes. */
 		if (RING_HAS_UNCONSUMED_RESPONSES(&np->rx))
 			napi_schedule(&np->napi);
+	}
+
+	if (np->smart_poll.feature_smart_poll) {
+		if ( hrtimer_start(&np->smart_poll.timer,
+			ktime_set(0,NANO_SECOND/np->smart_poll.smart_poll_freq),
+			HRTIMER_MODE_REL) ) {
+			printk(KERN_DEBUG "Failed to start hrtimer,"
+					"use interrupt mode for this packet\n");
+			np->rx.sring->private.netif.smartpoll_active = 0;
+		}
 	}
 
 	spin_unlock_irqrestore(&np->tx_lock, flags);
@@ -1444,7 +1490,7 @@ static int setup_netfront(struct xenbus_device *dev, struct netfront_info *info)
 }
 
 /* Common code used when first setting up, and when resuming. */
-static int talk_to_backend(struct xenbus_device *dev,
+static int talk_to_netback(struct xenbus_device *dev,
 			   struct netfront_info *info)
 {
 	const char *message;
@@ -1507,6 +1553,12 @@ again:
 		goto abort_transaction;
 	}
 
+	err = xenbus_printf(xbt, dev->nodename, "feature-smart-poll", "%d", use_smartpoll);
+	if (err) {
+		message = "writing feature-smart-poll";
+		goto abort_transaction;
+	}
+
 	err = xenbus_transaction_end(xbt, 0);
 	if (err) {
 		if (err == -EAGAIN)
@@ -1528,62 +1580,50 @@ again:
 
 static int xennet_set_sg(struct net_device *dev, u32 data)
 {
-	int val, rc;
-
 	if (data) {
 		struct netfront_info *np = netdev_priv(dev);
+		int val;
+
 		if (xenbus_scanf(XBT_NIL, np->xbdev->otherend, "feature-sg",
 				 "%d", &val) < 0)
 			val = 0;
-	} else
-		val = 0;
+		if (!val)
+			return -ENOSYS;
+	} else if (dev->mtu > ETH_DATA_LEN)
+		dev->mtu = ETH_DATA_LEN;
 
-	rc = ethtool_op_set_sg(dev, val);
-	if (rc == 0 && !val) {
-		if (dev->mtu > ETH_DATA_LEN)
-			dev->mtu = ETH_DATA_LEN;
-		if (data)
-			rc = -ENOSYS;
-	}
-	return rc;
+	return ethtool_op_set_sg(dev, data);
 }
 
 static int xennet_set_tso(struct net_device *dev, u32 data)
 {
-	int val, rc;
-
 	if (data) {
 		struct netfront_info *np = netdev_priv(dev);
+		int val;
+
 		if (xenbus_scanf(XBT_NIL, np->xbdev->otherend,
 				 "feature-gso-tcpv4", "%d", &val) < 0)
 			val = 0;
-	} else
-		val = 0;
+		if (!val)
+			return -ENOSYS;
+	}
 
-	rc = ethtool_op_set_tso(dev, val);
-	if (rc == 0 && !val && data)
-		rc = -ENOSYS;
-	return rc;
+	return ethtool_op_set_tso(dev, data);
 }
 
 static void xennet_set_features(struct net_device *dev)
 {
-	/* Set ROBUST, turn off all other GSO bits except TSO. */
-	dev->features =
-		(dev->features & NETIF_F_TSO) |
-		(dev->features & ~NETIF_F_GSO_MASK) |
-		NETIF_F_GSO_ROBUST;
+	/* Turn off all GSO bits except ROBUST. */
+	dev->features &= ~NETIF_F_GSO_MASK;
+	dev->features |= NETIF_F_GSO_ROBUST;
+	xennet_set_sg(dev, 0);
 
-	/*
-	 * We need checksum offload to enable scatter/gather, and
-	 * scatter/gather to enable TSO.  Calling xennet_set_sg and
-	 * xennet_set_tso ensures that Xenstore is probed for feature
-	 * support in the backend.
-	 */
-	xennet_set_sg(dev, ((dev->features & (NETIF_F_IP_CSUM | NETIF_F_SG)) ==
-			    (NETIF_F_IP_CSUM | NETIF_F_SG)));
-	xennet_set_tso(dev, ((dev->features & (NETIF_F_SG | NETIF_F_TSO)) ==
-			     (NETIF_F_SG | NETIF_F_TSO)));
+	/* We need checksum offload to enable scatter/gather and TSO. */
+	if (!(dev->features & NETIF_F_IP_CSUM))
+		return;
+
+	if (!xennet_set_sg(dev, 1))
+		xennet_set_tso(dev, 1);
 }
 
 static int xennet_connect(struct net_device *dev)
@@ -1606,7 +1646,26 @@ static int xennet_connect(struct net_device *dev)
 		return -ENODEV;
 	}
 
-	err = talk_to_backend(np->xbdev, np);
+	np->smart_poll.feature_smart_poll = 0;
+	if (use_smartpoll) {
+		err = xenbus_scanf(XBT_NIL, np->xbdev->otherend,
+				   "feature-smart-poll", "%u",
+				   &np->smart_poll.feature_smart_poll);
+		if (err != 1)
+			np->smart_poll.feature_smart_poll = 0;
+	}
+
+	hrtimer_init(&np->smart_poll.timer, CLOCK_MONOTONIC,
+		     HRTIMER_MODE_REL);
+	if (np->smart_poll.feature_smart_poll) {
+		np->smart_poll.timer.function = smart_poll_function;
+		np->smart_poll.netdev = dev;
+		np->smart_poll.smart_poll_freq = DEFAULT_SMART_POLL_FREQ;
+		np->smart_poll.active = 0;
+		np->smart_poll.counter = 0;
+	}
+
+	err = talk_to_netback(np->xbdev, np);
 	if (err)
 		return err;
 
@@ -1660,7 +1719,7 @@ static int xennet_connect(struct net_device *dev)
 /**
  * Callback received when the backend's state changes.
  */
-static void backend_changed(struct xenbus_device *dev,
+static void netback_changed(struct xenbus_device *dev,
 			    enum xenbus_state backend_state)
 {
 	struct netfront_info *np = dev_get_drvdata(&dev->dev);
@@ -1671,6 +1730,9 @@ static void backend_changed(struct xenbus_device *dev,
 	switch (backend_state) {
 	case XenbusStateInitialising:
 	case XenbusStateInitialised:
+	case XenbusStateReconfiguring:
+	case XenbusStateReconfigured:
+	case XenbusStateConnected:
 	case XenbusStateUnknown:
 	case XenbusStateClosed:
 		break;
@@ -1681,9 +1743,6 @@ static void backend_changed(struct xenbus_device *dev,
 		if (xennet_connect(netdev) != 0)
 			break;
 		xenbus_switch_state(dev, XenbusStateConnected);
-		break;
-
-	case XenbusStateConnected:
 		netif_notify_peers(netdev);
 		break;
 
@@ -1693,12 +1752,30 @@ static void backend_changed(struct xenbus_device *dev,
 	}
 }
 
+static int xennet_get_coalesce(struct net_device *netdev,
+			       struct ethtool_coalesce *ec)
+{
+	struct netfront_info *np = netdev_priv(netdev);
+	ec->rx_coalesce_usecs = MICRO_SECOND / np->smart_poll.smart_poll_freq;
+	return 0;
+}
+
+static int xennet_set_coalesce(struct net_device *netdev,
+		struct ethtool_coalesce *ec)
+{
+	struct netfront_info *np = netdev_priv(netdev);
+	np->smart_poll.smart_poll_freq = MICRO_SECOND / ec->rx_coalesce_usecs;
+	return 0;
+}
+
 static const struct ethtool_ops xennet_ethtool_ops =
 {
 	.set_tx_csum = ethtool_op_set_tx_csum,
 	.set_sg = xennet_set_sg,
 	.set_tso = xennet_set_tso,
 	.get_link = ethtool_op_get_link,
+	.get_coalesce = xennet_get_coalesce,
+	.set_coalesce = xennet_set_coalesce,
 };
 
 #ifdef CONFIG_SYSFS
@@ -1863,8 +1940,9 @@ static struct xenbus_driver netfront_driver = {
 	.ids = netfront_ids,
 	.probe = netfront_probe,
 	.remove = __devexit_p(xennet_remove),
+	.suspend = netfront_suspend,
 	.resume = netfront_resume,
-	.otherend_changed = backend_changed,
+	.otherend_changed = netback_changed,
 };
 
 static int __init netif_init(void)
