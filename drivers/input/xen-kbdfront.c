@@ -21,7 +21,10 @@
 #include <linux/errno.h>
 #include <linux/module.h>
 #include <linux/input.h>
+
 #include <asm/xen/hypervisor.h>
+
+#include <xen/xen.h>
 #include <xen/events.h>
 #include <xen/page.h>
 #include <xen/interface/io/fbif.h>
@@ -286,6 +289,8 @@ static void xenkbd_backend_changed(struct xenbus_device *dev,
 	switch (backend_state) {
 	case XenbusStateInitialising:
 	case XenbusStateInitialised:
+	case XenbusStateReconfiguring:
+	case XenbusStateReconfigured:
 	case XenbusStateUnknown:
 	case XenbusStateClosed:
 		break;
@@ -300,8 +305,7 @@ InitWait:
 			ret = xenbus_printf(XBT_NIL, info->xbdev->nodename,
 					    "request-abs-pointer", "1");
 			if (ret)
-				printk(KERN_WARNING
-				       "xenkbd: can't request abs-pointer");
+				pr_warning("can't request abs-pointer\n");
 		}
 		xenbus_switch_state(dev, XenbusStateConnected);
 		break;
