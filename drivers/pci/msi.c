@@ -18,7 +18,8 @@
 #include <linux/smp.h>
 #include <linux/errno.h>
 #include <linux/io.h>
-
+#include <asm/xen/hypercall.h>
+#include <asm/xen/hypervisor.h>
 #include "pci.h"
 #include "msi.h"
 
@@ -395,6 +396,20 @@ static void __pci_restore_msix_state(struct pci_dev *dev)
 
 void pci_restore_msi_state(struct pci_dev *dev)
 {
+  if (xen_initial_domain()) {
+    struct physdev_restore_msi physdev;
+
+    if (!dev->msi_enabled && !dev->msix_enabled)
+      return;
+
+    pci_intx_for_msi(dev, 0);
+
+    physdev.bus = dev->bus->number;
+    physdev.devfn = dev->devfn;
+    HYPERVISOR_physdev_op(PHYSDEVOP_restore_msi, &physdev);
+
+    return;
+  }
 	__pci_restore_msi_state(dev);
 	__pci_restore_msix_state(dev);
 }
