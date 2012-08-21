@@ -11,6 +11,8 @@
 #include <asm/gart.h>
 #include <asm/calgary.h>
 #include <asm/amd_iommu.h>
+#include <asm/x86_init.h>
+#include <asm/xen/swiotlb-xen.h>
 
 static int forbid_dac __read_mostly;
 
@@ -126,6 +128,8 @@ void __init pci_iommu_alloc(void)
 	/* free the range so iommu could get some range less than 4G */
 	dma32_free_bootmem();
 #endif
+  if (pci_xen_swiotlb_detect() || pci_swiotlb_detect())
+    goto out;
 
 	/*
 	 * The order of these functions is important for
@@ -138,6 +142,9 @@ void __init pci_iommu_alloc(void)
 	detect_intel_iommu();
 
 	amd_iommu_detect();
+
+out:
+  pci_xen_swiotlb_init();
 
 	pci_swiotlb_init();
 }
