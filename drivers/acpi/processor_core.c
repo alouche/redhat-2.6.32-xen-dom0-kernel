@@ -58,6 +58,7 @@
 #include <acpi/acpi_bus.h>
 #include <acpi/acpi_drivers.h>
 #include <acpi/processor.h>
+#include <xen/acpi.h>
 
 #define PREFIX "ACPI: "
 
@@ -1177,7 +1178,11 @@ static int __init acpi_processor_init(void)
 		       cpuidle_get_driver()->name);
 	}
 
-	result = acpi_bus_register_driver(&acpi_processor_driver);
+  if (xen_initial_domain())
+    result = xen_acpi_processor_init();
+  else
+	  result = acpi_bus_register_driver(&acpi_processor_driver);
+
 	if (result < 0)
 		goto out_cpuidle;
 
@@ -1212,7 +1217,10 @@ static void __exit acpi_processor_exit(void)
 
 	acpi_processor_uninstall_hotplug_notify();
 
-	acpi_bus_unregister_driver(&acpi_processor_driver);
+  if (xen_initial_domain())
+    xen_acpi_processor_exit();
+  else
+	  acpi_bus_unregister_driver(&acpi_processor_driver);
 
 	cpuidle_unregister_driver(&acpi_idle_driver);
 

@@ -34,6 +34,7 @@
 #include <linux/memory.h>
 #endif
 #include <acpi/acpi_drivers.h>
+#include <xen/acpi.h>
 
 #define ACPI_MEMORY_DEVICE_CLASS		"memory"
 #define ACPI_MEMORY_DEVICE_HID			"PNP0C80"
@@ -250,6 +251,9 @@ static int acpi_memory_enable_device(struct acpi_memory_device *mem_device)
 		mem_device->state = MEMORY_INVALID_STATE;
 		return result;
 	}
+
+  if (xen_initial_domain())
+    return xen_hotadd_memory(mem_device);
 
 	node = acpi_get_node(mem_device->device->handle);
 	/*
