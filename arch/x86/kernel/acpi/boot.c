@@ -42,6 +42,9 @@
 #include <asm/mpspec.h>
 #include <asm/smp.h>
 
+#include <asm/xen/pci.h>
+#include <asm/xen/hypervisor.h>
+
 static int __initdata acpi_force = 0;
 u32 acpi_rsdt_forced;
 int acpi_disabled;
@@ -149,6 +152,10 @@ static int __init acpi_parse_madt(struct acpi_table_header *table)
 static void __cpuinit acpi_register_lapic(int id, u8 enabled)
 {
 	unsigned int ver = 0;
+
+  /* We don't want to register lapics when in Xen dom0 */
+	if (xen_initial_domain())
+	  return;
 
 	if (id >= (MAX_LOCAL_APIC-1)) {
 		printk(KERN_INFO PREFIX "skipped apicid that is too big\n");
@@ -471,6 +478,10 @@ int acpi_register_gsi(struct device *dev, u32 gsi, int trigger, int polarity)
 	unsigned int irq;
 	unsigned int plat_gsi = gsi;
 
+  irq = xen_register_gsi(gsi, trigger, polarity);
+  if (irq >= 0)
+    return irq;
+
 #ifdef CONFIG_PCI
 	/*
 	 * Make sure all (legacy) PCI IRQs are set as level-triggered.
@@ -768,6 +779,10 @@ static int __init acpi_parse_fadt(struct acpi_table_header *table)
 
 static void __init acpi_register_lapic_address(unsigned long address)
 {
+  /* Xen dom0 doesn't have usable lapics */
+  if (xen_initial_domain())
+    return;
+
 	mp_lapic_addr = address;
 
 	set_fixmap_nocache(FIX_APIC_BASE, address);
@@ -887,6 +902,9 @@ int __init acpi_probe_gsi(void)
 		if (gsi > max_gsi)
 			max_gsi = gsi;
 	}
+
+  if (xen_initial_domain())
+    max_gsi += 255; /* Plus maximum entries of an ioapic. */
 
 	return max_gsi + 1;
 }
