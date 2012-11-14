@@ -112,7 +112,7 @@ static inline void raw_safe_halt(void)
 
 static inline void halt(void)
 {
-	PVOP_VCALL0(pv_irq_ops.halt);
+	PVOP_VCALL0(pv_irq_ops.safe_halt);
 }
 
 static inline void wbinvd(void)
@@ -341,6 +341,11 @@ static inline void set_iopl_mask(unsigned mask)
 	PVOP_VCALL1(pv_cpu_ops.set_iopl_mask, mask);
 }
 
+static inline void set_io_bitmap(struct thread_struct *thread, unsigned long bytes_updated)
+{
+  PVOP_VCALL2(pv_cpu_ops.set_io_bitmap, thread, bytes_updated);
+}
+
 /* The paravirtualized I/O functions */
 static inline void slow_down_io(void)
 {
@@ -440,6 +445,15 @@ static inline void paravirt_release_pud(unsigned long pfn)
 {
 	PVOP_VCALL1(pv_mmu_ops.release_pud, pfn);
 }
+
+#ifdef CONFIG_HIGHPTE
+static inline void *kmap_atomic_pte(struct page *page, enum km_type type)
+{
+  unsigned long ret;
+  ret = PVOP_CALL2(unsigned long, pv_mmu_ops.kmap_atomic_pte, page, type);
+  return (void *)ret;
+}
+#endif
 
 static inline void pte_update(struct mm_struct *mm, unsigned long addr,
 			      pte_t *ptep)
@@ -793,6 +807,19 @@ static __always_inline void __raw_spin_unlock(struct raw_spinlock *lock)
 #define PV_SAVE_ALL_CALLER_REGS		"pushl %ecx;"
 #define PV_RESTORE_ALL_CALLER_REGS	"popl  %ecx;"
 
+#ifdef CONFIG_FRAME_POINTER
+#define PV_SAVE_ALL_CALLER_REGS     \
+  "push %ebp;"        \
+  "mov %esp, %ebp;"     \
+  __PV_SAVE_ALL_CALLER_REGS
+#define PV_RESTORE_ALL_CALLER_REGS    \
+  __PV_RESTORE_ALL_CALLER_REGS    \
+  "leave;"
+#else
+#define PV_SAVE_ALL_CALLER_REGS   __PV_SAVE_ALL_CALLER_REGS
+#define PV_RESTORE_ALL_CALLER_REGS  __PV_RESTORE_ALL_CALLER_REGS
+#endif
+
 #define PV_FLAGS_ARG "0"
 #define PV_EXTRA_CLOBBERS
 #define PV_VEXTRA_CLOBBERS
@@ -816,6 +843,19 @@ static __always_inline void __raw_spin_unlock(struct raw_spinlock *lock)
 	"pop %rsi;"							\
 	"pop %rdx;"							\
 	"pop %rcx;"
+
+#ifdef CONFIG_FRAME_POINTER
+#define PV_SAVE_ALL_CALLER_REGS     \
+  "push %rbp;"        \
+  "mov %rsp, %rbp;"     \
+  __PV_SAVE_ALL_CALLER_REGS
+#define PV_RESTORE_ALL_CALLER_REGS    \
+  __PV_RESTORE_ALL_CALLER_REGS    \
+  "leaveq;"
+#else
+#define PV_SAVE_ALL_CALLER_REGS   __PV_SAVE_ALL_CALLER_REGS
+#define PV_RESTORE_ALL_CALLER_REGS  __PV_RESTORE_ALL_CALLER_REGS
+#endif
 
 /* We save some registers, but all of them, that's too much. We clobber all
  * caller saved registers but the argument parameter */
